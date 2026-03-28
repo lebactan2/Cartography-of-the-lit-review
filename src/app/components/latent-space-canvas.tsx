@@ -136,6 +136,22 @@ export function LatentSpaceCanvas() {
   // Normal map background cache
   const normalMapCache = useRef<HTMLCanvasElement | null>(null);
 
+  // ── Spread animation system ──
+  // Tracks which nodes are "open" (visible). Only open nodes are drawn.
+  // Double-click a node → expand its connections (animate from parent).
+  // Double-click an already-expanded node → collapse its children.
+  // Page starts with only central node visible.
+  const openNodes = useRef<Set<string>>(new Set());
+  const expandedNodes = useRef<Set<string>>(new Set()); // nodes whose children have been spread
+  // Per-node animation: { from: Vec3, progress: number (0→1), startTime: number, delay: number }
+  const nodeAnims = useRef<Record<string, { fromX: number; fromY: number; fromZ: number; startTime: number; delay: number; duration: number; expanding: boolean }>>({});
+  // Collapse animation: nodes fading out animate toward their parent
+  const collapsingNodes = useRef<Set<string>>(new Set());
+  const openNodesInitialized = useRef(false);
+  // Double-right-click detection
+  const lastRightClickTime = useRef(0);
+  const lastRightClickNode = useRef<string | null>(null);
+
   // Picture/Comment dialog state
   const [pictureTarget, setPictureTarget] = useState<string | null>(null);
   const [pictureFullscreen, setPictureFullscreen] = useState(false);
@@ -516,7 +532,7 @@ export function LatentSpaceCanvas() {
 
       // ── EMERGENT CENTRAL EFFECT for human-learning ──
       const centralNode = nodes.find(n => n.type === "central");
-      if (centralNode) {
+      if (centralNode && openNodes.current.has(centralNode.id)) {
         let cpt: Vec3 = { x: centralNode.x, y: centralNode.y, z: centralNode.z };
         cpt = rotateY(cpt, rY); cpt = rotateX(cpt, rX);
         const cp = project(cpt, w, h, fov, camZ, zoom, pan);
@@ -537,9 +553,10 @@ export function LatentSpaceCanvas() {
           }
         }
 
-        // Radiating energy lines to each connected node
+        // Radiating energy lines to each connected open node
         const connectedNodeIds = centralNode.connections;
         for (const cid of connectedNodeIds) {
+          if (!openNodes.current.has(cid) && !collapsingNodes.current.has(cid)) continue;
           const target = nodeMap.get(cid);
           if (!target) continue;
           let tpt: Vec3 = { x: target.x, y: target.y, z: target.z };
@@ -592,14 +609,67 @@ export function LatentSpaceCanvas() {
         ctx.fill();
       }
 
-      type PN = { node: Node3D; sx: number; sy: number; scale: number; depth: number };
+      // ── Open/close node animation system ──
+      // Initialize: only central node visible on first frame
+      if (!openNodesInitialized.current) {
+        openNodesInitialized.current = true;
+        const central = nodes.find(n => n.type === "central");
+        if (central) openNodes.current.add(central.id);
+      }
+
+      // Update per-node animations
+      const animFinished: string[] = [];
+      for (const [nid, anim] of Object.entries(nodeAnims.current)) {
+        const elapsed = t - anim.startTime;
+        const nodeElapsed = Math.max(0, elapsed - anim.delay);
+        const progress = Math.min(1, nodeElapsed / anim.duration);
+        if (progress >= 1) animFinished.push(nid);
+      }
+      // Clean up finished collapse animations (remove from collapsingNodes)
+      for (const nid of animFinished) {
+        if (collapsingNodes.current.has(nid)) {
+          collapsingNodes.current.delete(nid);
+        }
+        delete nodeAnims.current[nid];
+      }
+
+      type PN = { node: Node3D; sx: number; sy: number; scale: number; depth: number; animAlpha: number };
       const projN: PN[] = [];
       const projMap = new Map<string, PN>();
       for (const node of nodes) {
-        let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
+        const isOpen = openNodes.current.has(node.id);
+        const isCollapsing = collapsingNodes.current.has(node.id);
+        if (!isOpen && !isCollapsing) continue; // skip invisible nodes
+
+        const anim = nodeAnims.current[node.id];
+        let animAlpha = 1;
+        let px = node.x, py = node.y, pz = node.z;
+
+        if (anim) {
+          const elapsed = t - anim.startTime;
+          const nodeElapsed = Math.max(0, elapsed - anim.delay);
+          const progress = Math.min(1, nodeElapsed / anim.duration);
+          const ease = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+
+          if (anim.expanding) {
+            // Animate from parent position to real position
+            px = anim.fromX + (node.x - anim.fromX) * ease;
+            py = anim.fromY + (node.y - anim.fromY) * ease;
+            pz = anim.fromZ + (node.z - anim.fromZ) * ease;
+            animAlpha = ease;
+          } else {
+            // Collapsing: animate from real position to parent position
+            px = node.x + (anim.fromX - node.x) * ease;
+            py = node.y + (anim.fromY - node.y) * ease;
+            pz = node.z + (anim.fromZ - node.z) * ease;
+            animAlpha = 1 - ease;
+          }
+        }
+
+        let pt: Vec3 = { x: px, y: py, z: pz };
         pt = rotateY(pt, rY); pt = rotateX(pt, rX);
         const pr = project(pt, w, h, fov, camZ, zoom, pan);
-        const pn: PN = { node, ...pr };
+        const pn: PN = { node, ...pr, animAlpha };
         projN.push(pn);
         projMap.set(node.id, pn);
       }
@@ -626,6 +696,8 @@ export function LatentSpaceCanvas() {
         let alpha = (edge.isCross ? 0.1 : 0.18) * edge.strength * depthFade * (isBright ? 3 : 1);
         if (isRelevant && sel) alpha *= 3.5;
         if (isDimmed) alpha *= 0.04;
+        // Multiply by animation alpha of both nodes
+        alpha *= fp.animAlpha * tp.animAlpha;
         if (alpha < 0.004) continue;
 
         ctx.beginPath();
@@ -669,12 +741,12 @@ export function LatentSpaceCanvas() {
 
       // ── Draw nodes ──
       for (const pn of projN) {
-        const { node, sx, sy, scale, depth } = pn;
+        const { node, sx, sy, scale, depth, animAlpha } = pn;
         const depthFade = Math.max(0.12, Math.min(1, 1 - depth / 1200));
         const isClusterSel = sel === node.cluster;
         const isDimmed = sel && !isClusterSel;
 
-        let nodeAlpha = depthFade;
+        let nodeAlpha = depthFade * animAlpha;
         if (isDimmed) nodeAlpha *= 0.06;
         if (isClusterSel) nodeAlpha = Math.min(1, nodeAlpha * 1.5);
         if (nodeAlpha < 0.02) continue;
@@ -1002,6 +1074,7 @@ export function LatentSpaceCanvas() {
         const w = canvas.clientWidth, h = canvas.clientHeight;
         const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
         for (const node of dataRef.current.nodes) {
+          if (!openNodes.current.has(node.id)) continue;
           let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
           pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
           const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1010,7 +1083,7 @@ export function LatentSpaceCanvas() {
           if (dx * dx + dy * dy < hitR * hitR) {
             dragConnectRef.current = { sourceId: node.id, sx: pr.sx, sy: pr.sy };
             dragConnectMouseRef.current = { x: mx, y: my };
-            return; // Don't start drag-rotate
+            return;
           }
         }
       }
@@ -1024,6 +1097,7 @@ export function LatentSpaceCanvas() {
         const w = canvas.clientWidth, h = canvas.clientHeight;
         const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
         for (const node of dataRef.current.nodes) {
+          if (!openNodes.current.has(node.id)) continue;
           let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
           pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
           const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1049,6 +1123,7 @@ export function LatentSpaceCanvas() {
           const w = canvas.clientWidth, h = canvas.clientHeight;
           const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
           for (const node of dataRef.current.nodes) {
+            if (!openNodes.current.has(node.id)) continue;
             let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
             pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
             const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1145,6 +1220,7 @@ export function LatentSpaceCanvas() {
 
     let closest: { node: Node3D; dist: number; sx: number; sy: number } | null = null;
     for (const node of data.nodes) {
+      if (!openNodes.current.has(node.id)) continue;
       let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
       pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
       const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1174,6 +1250,7 @@ export function LatentSpaceCanvas() {
       const sourceId = dragConnectRef.current.sourceId;
       for (const node of dataRef.current.nodes) {
         if (node.id === sourceId) continue;
+        if (!openNodes.current.has(node.id)) continue;
         let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
         pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
         const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1209,6 +1286,7 @@ export function LatentSpaceCanvas() {
     const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
 
     for (const node of data.nodes) {
+      if (!openNodes.current.has(node.id)) continue; // only interact with visible nodes
       let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
       pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
       const pr = project(pt, w, h, fov, camZ, zoom, pan);
@@ -1268,23 +1346,66 @@ export function LatentSpaceCanvas() {
     const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
 
     for (const node of data.nodes) {
+      if (!openNodes.current.has(node.id)) continue; // only hit-test visible nodes
       let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
       pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
       const pr = project(pt, w, h, fov, camZ, zoom, pan);
       const dx = mx - pr.sx, dy = my - pr.sy;
       const hitR = Math.max(18, node.size * pr.scale * 3);
       if (dx * dx + dy * dy < hitR * hitR) {
-        setEditingNode(node.id);
-        setEditText(node.label);
-        setEditFormatting(node.formatting || {});
-        setEditVideoUrl("");
-        setEditCommentText("");
+        if (expandedNodes.current.has(node.id)) {
+          // Already expanded → collapse: hide all children that were expanded from this node
+          const toCollapse: string[] = [];
+          const collectChildren = (parentId: string) => {
+            const parent = data.nodes.find(n => n.id === parentId);
+            if (!parent) return;
+            for (const connId of parent.connections) {
+              if (connId === node.id) continue; // don't collapse back to the clicked node
+              if (openNodes.current.has(connId) && connId !== node.id) {
+                // Only collapse if this node was a child (not a separately opened root)
+                toCollapse.push(connId);
+                // Also collapse children of children recursively
+                if (expandedNodes.current.has(connId)) {
+                  expandedNodes.current.delete(connId);
+                  collectChildren(connId);
+                }
+              }
+            }
+          };
+          collectChildren(node.id);
+          expandedNodes.current.delete(node.id);
+          const t = timeRef.current;
+          for (const cid of toCollapse) {
+            openNodes.current.delete(cid);
+            expandedNodes.current.delete(cid);
+            collapsingNodes.current.add(cid);
+            nodeAnims.current[cid] = {
+              fromX: node.x, fromY: node.y, fromZ: node.z,
+              startTime: t, delay: 0, duration: 0.6, expanding: false,
+            };
+          }
+        } else {
+          // Not expanded → expand: show connected nodes with animation
+          expandedNodes.current.add(node.id);
+          const t = timeRef.current;
+          let delayIdx = 0;
+          for (const connId of node.connections) {
+            if (openNodes.current.has(connId)) continue; // already visible
+            openNodes.current.add(connId);
+            nodeAnims.current[connId] = {
+              fromX: node.x, fromY: node.y, fromZ: node.z,
+              startTime: t, delay: delayIdx * 0.08, duration: 1.0, expanding: true,
+            };
+            delayIdx++;
+          }
+        }
         return;
       }
     }
+    // Double-click empty space → do nothing
   }, [data.nodes]);
 
-  // Right-click: open connection manager for a node
+  // Right-click: single = context menu, double = edit dialog
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     if (!canvasRef.current) return;
@@ -1292,18 +1413,38 @@ export function LatentSpaceCanvas() {
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const w = canvasRef.current.clientWidth, h = canvasRef.current.clientHeight;
     const fov = PERSPECTIVE_FOV, camZ = BASE_CAM_Z, zoom = zoomRef.current, pan = panRef.current;
+    const now = Date.now();
 
     for (const node of data.nodes) {
+      if (!openNodes.current.has(node.id)) continue;
       let pt: Vec3 = { x: node.x, y: node.y, z: node.z };
       pt = rotateY(pt, rotYRef.current); pt = rotateX(pt, rotXRef.current);
       const pr = project(pt, w, h, fov, camZ, zoom, pan);
       const dx = mx - pr.sx, dy = my - pr.sy;
       const hitR = Math.max(14, node.size * pr.scale * 2.5);
       if (dx * dx + dy * dy < hitR * hitR) {
-        setConnectionPopup({ nodeId: node.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
+        // Check for double-right-click (within 400ms on same node)
+        if (lastRightClickNode.current === node.id && now - lastRightClickTime.current < 400) {
+          // Double-right-click → open edit dialog
+          lastRightClickTime.current = 0;
+          lastRightClickNode.current = null;
+          setConnectionPopup(null);
+          setEditingNode(node.id);
+          setEditText(node.label);
+          setEditFormatting(node.formatting || {});
+          setEditVideoUrl("");
+          setEditCommentText("");
+        } else {
+          // Single right-click → context menu
+          lastRightClickTime.current = now;
+          lastRightClickNode.current = node.id;
+          setConnectionPopup({ nodeId: node.id, x: e.clientX - rect.left, y: e.clientY - rect.top });
+        }
         return;
       }
     }
+    lastRightClickTime.current = 0;
+    lastRightClickNode.current = null;
     setConnectionPopup(null);
   }, [data.nodes]);
 
@@ -1541,7 +1682,7 @@ export function LatentSpaceCanvas() {
       positions[node.id] = { x: node.x, y: node.y, z: node.z };
     }
     const saveData = {
-      version: 4,
+      version: 5,
       savedAt: new Date().toISOString(),
       images: nodeImages,
       comments: nodeComments,
@@ -1550,6 +1691,8 @@ export function LatentSpaceCanvas() {
       positions,
       edges: data.edges.map(e => ({ from: e.from, to: e.to, strength: e.strength, isCross: e.isCross })),
       tree: treeData,
+      openNodeIds: Array.from(openNodes.current),
+      expandedNodeIds: Array.from(expandedNodes.current),
     };
     localStorage.setItem("latentSpace_fullSave", JSON.stringify(saveData));
   }, [nodeImages, nodeComments, nodeVideos, data.nodes, data.edges, treeData]);
@@ -1563,7 +1706,7 @@ export function LatentSpaceCanvas() {
       positions[node.id] = { x: node.x, y: node.y, z: node.z };
     }
     const saveData = {
-      version: 4,
+      version: 5,
       savedAt: new Date().toISOString(),
       images: nodeImages,
       comments: nodeComments,
@@ -1572,6 +1715,8 @@ export function LatentSpaceCanvas() {
       positions,
       edges: data.edges.map(e => ({ from: e.from, to: e.to, strength: e.strength, isCross: e.isCross })),
       tree: treeData,
+      openNodeIds: Array.from(openNodes.current),
+      expandedNodeIds: Array.from(expandedNodes.current),
     };
     const blob = new Blob([JSON.stringify(saveData, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1626,6 +1771,14 @@ export function LatentSpaceCanvas() {
       }
       if (saveData.tree && Object.keys(saveData.tree).length > 0) {
         setTreeData(saveData.tree);
+      }
+      // Restore open/expanded node state
+      if (saveData.openNodeIds && Array.isArray(saveData.openNodeIds)) {
+        openNodes.current = new Set(saveData.openNodeIds);
+        openNodesInitialized.current = true;
+      }
+      if (saveData.expandedNodeIds && Array.isArray(saveData.expandedNodeIds)) {
+        expandedNodes.current = new Set(saveData.expandedNodeIds);
       }
     } catch { /* ignore corrupt data */ }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
