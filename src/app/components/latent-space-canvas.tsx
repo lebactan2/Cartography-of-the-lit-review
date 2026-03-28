@@ -142,6 +142,8 @@ export function LatentSpaceCanvas() {
   // Double-click an already-expanded node → collapse its children.
   // Page starts with only central node visible.
   const openNodes = useRef<Set<string>>(new Set());
+  const [openNodesVersion, setOpenNodesVersion] = useState(0); // bumped to re-render tree when openNodes changes
+  const bumpOpenNodes = useCallback(() => setOpenNodesVersion(v => v + 1), []);
   const expandedNodes = useRef<Set<string>>(new Set()); // nodes whose children have been spread
   // Per-node animation: { from: Vec3, progress: number (0→1), startTime: number, delay: number }
   const nodeAnims = useRef<Record<string, { fromX: number; fromY: number; fromZ: number; startTime: number; delay: number; duration: number; expanding: boolean }>>({});
@@ -1384,6 +1386,7 @@ export function LatentSpaceCanvas() {
               startTime: t, delay: 0, duration: 0.6, expanding: false,
             };
           }
+          bumpOpenNodes();
         } else {
           // Not expanded → expand: show connected nodes with animation
           expandedNodes.current.add(node.id);
@@ -1398,12 +1401,13 @@ export function LatentSpaceCanvas() {
             };
             delayIdx++;
           }
+          bumpOpenNodes();
         }
         return;
       }
     }
     // Double-click empty space → do nothing
-  }, [data.nodes]);
+  }, [data.nodes, bumpOpenNodes]);
 
   // Right-click: single = context menu, double = edit dialog
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
@@ -1776,6 +1780,7 @@ export function LatentSpaceCanvas() {
       if (saveData.openNodeIds && Array.isArray(saveData.openNodeIds)) {
         openNodes.current = new Set(saveData.openNodeIds);
         openNodesInitialized.current = true;
+        bumpOpenNodes();
       }
       if (saveData.expandedNodeIds && Array.isArray(saveData.expandedNodeIds)) {
         expandedNodes.current = new Set(saveData.expandedNodeIds);
@@ -3068,6 +3073,9 @@ export function LatentSpaceCanvas() {
             const rootNode = td ? data.nodes.find(n => n.id === td.rootId) : null;
             const rootLabel = rootNode?.label.split("\n")[0] || meta.name;
 
+            // Only show cluster if its root is open (visible on canvas)
+            if (rootNode && !openNodes.current.has(rootNode.id)) return null;
+
             return (
               <div key={clusterKey} style={{ marginBottom: 2 }}>
                 {/* Cluster root — CAPS, draggable */}
@@ -3120,12 +3128,13 @@ export function LatentSpaceCanvas() {
                 {/* Sub-nodes + children with Win98-style tree lines */}
                 {!isCollapsed && td && (
                   <div style={{ paddingLeft: 4 }}>
-                    {td.subs.map((sub, subIdx) => {
+                    {td.subs.filter(sub => openNodes.current.has(sub.nodeId)).map((sub, subIdx) => {
                       const subNode = data.nodes.find(n => n.id === sub.nodeId);
                       const subLabel = subNode?.label.split("\n")[0] || sub.nodeId;
                       const subCollapsed = treeCollapsed[sub.nodeId];
-                      const hasCh = sub.children.length > 0;
-                      const isLastSub = subIdx === td.subs.length - 1 && td.ungrouped.length === 0;
+                      const visibleChildren = sub.children.filter(cid => openNodes.current.has(cid));
+                      const hasCh = visibleChildren.length > 0;
+                      const isLastSub = subIdx === td.subs.filter(s => openNodes.current.has(s.nodeId)).length - 1 && td.ungrouped.filter(id => openNodes.current.has(id)).length === 0;
 
                       return (
                         <div key={sub.nodeId} style={{ display: "flex", alignItems: "stretch" }}>
@@ -3192,10 +3201,10 @@ export function LatentSpaceCanvas() {
                             {/* Children — normal, with tree lines */}
                             {hasCh && !subCollapsed && (
                               <div style={{ paddingLeft: 4 }}>
-                                {sub.children.map((childId, childIdx) => {
+                                {visibleChildren.map((childId, childIdx) => {
                                   const childNode = data.nodes.find(n => n.id === childId);
                                   const childLabel = childNode?.label.split("\n")[0] || childId;
-                                  const isLastChild = childIdx === sub.children.length - 1;
+                                  const isLastChild = childIdx === visibleChildren.length - 1;
                                   return (
                                     <div key={childId} style={{ display: "flex", alignItems: "stretch" }}>
                                       {/* Tree line connector */}
@@ -3256,10 +3265,11 @@ export function LatentSpaceCanvas() {
                     })}
 
                     {/* Ungrouped nodes with tree lines */}
-                    {td.ungrouped.map((uid, ugIdx) => {
+                    {td.ungrouped.filter(uid => openNodes.current.has(uid)).map((uid, ugIdx) => {
                       const uNode = data.nodes.find(n => n.id === uid);
                       const uLabel = uNode?.label.split("\n")[0] || uid;
-                      const isLastUg = ugIdx === td.ungrouped.length - 1;
+                      const visibleUngrouped = td.ungrouped.filter(id => openNodes.current.has(id));
+                      const isLastUg = ugIdx === visibleUngrouped.length - 1;
                       return (
                         <div key={uid} style={{ display: "flex", alignItems: "stretch" }}>
                           {/* Tree line connector */}
